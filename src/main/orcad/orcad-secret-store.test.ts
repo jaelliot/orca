@@ -267,9 +267,9 @@ describe('createOrcadSecretStore', () => {
     const record = JSON.parse(readFileSync(join(keyDir, STATE_A), 'utf8'))
     expect(record.backend).toBe('os-keyring-strict')
     expect(keyring.items.get(record.account)).toBeDefined()
-    expect((await prepare({ env: STRICT, osKeyring: keyring })).store.decryptString(
-      concurrent.sealed
-    )).toBe('file-winner')
+    expect(
+      (await prepare({ env: STRICT, osKeyring: keyring })).store.decryptString(concurrent.sealed)
+    ).toBe('file-winner')
   })
 
   it('refuses implicit plaintext overwrite of strict credentials in temporary profiles', async () => {
@@ -291,9 +291,7 @@ describe('createOrcadSecretStore', () => {
     expect(ready).toBe(false)
     expect(temporary.isEncryptionAvailable()).toBe(true)
     setSecretStore(temporary)
-    expect(() => writeEncryptedCredential('Linear', saved, 'replacement')).toThrow(
-      /cannot unseal/
-    )
+    expect(() => writeEncryptedCredential('Linear', saved, 'replacement')).toThrow(/cannot unseal/)
     expect(readFileSync(saved)).toEqual(before)
     expect(readFileSync(join(keyDir, STATE_A))).toEqual(stateBefore)
   })
