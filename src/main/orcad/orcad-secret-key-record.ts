@@ -22,9 +22,10 @@ import { ORCAD_MASTER_KEY_BYTES } from './orcad-secret-sealing'
 import { hasErrorCode, isProcessAlive } from '../daemon/daemon-process-inspection'
 import { errorMessage } from '../../shared/error-message'
 
-// Read legacy keyring records only for migration.
+// Older builds must reject strict keyring records instead of downgrading them to file keys.
 export type StoredKeyState =
   | { version: 1; backend: 'os-keyring'; account: string; check: string }
+  | { version: 1; backend: 'os-keyring-strict'; account: string; check: string; hostBound: boolean }
   | {
       version: 1
       backend: 'host-file'
@@ -61,6 +62,19 @@ function parseStoredState(raw: string): StoredKeyState | null {
     }
   }
   if (
+    record.backend === 'os-keyring-strict' &&
+    typeof record.account === 'string' &&
+    typeof record.hostBound === 'boolean'
+  ) {
+    return {
+      version: 1,
+      backend: 'os-keyring-strict',
+      account: record.account,
+      check: record.check,
+      hostBound: record.hostBound
+    }
+  }
+  if (
     record.backend === 'host-file' &&
     typeof record.key === 'string' &&
     typeof record.hostBound === 'boolean'
@@ -86,6 +100,14 @@ function machineTag(machineId: string | null): string {
     .update(machineId ?? 'no-machine-id')
     .digest('hex')
     .slice(0, 16)
+}
+
+/** Separate keyring accounts for hosts sharing a user home. */
+export function keyringAccount(keyDir: string, machineId: string | null): string {
+  const digest = createHash('sha256')
+    .update(`${resolve(keyDir)}\0${machineTag(machineId)}`)
+    .digest('hex')
+  return `home-${digest.slice(0, 16)}`
 }
 
 /** Machine-specific records prevent hosts sharing a home from overwriting each other's keys. */
