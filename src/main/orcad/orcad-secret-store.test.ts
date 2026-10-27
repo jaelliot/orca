@@ -249,7 +249,7 @@ describe('createOrcadSecretStore', () => {
   it('keeps the file-mode winner usable when it races strict keyring creation', async () => {
     const keyring = fakeKeyring()
     const save = keyring.store.bind(keyring)
-    const concurrent = { sealed: Buffer.alloc(0) }
+    const concurrent: { sealed: Buffer } = { sealed: Buffer.alloc(0) }
     let raced = false
     keyring.store = async (account, value) => {
       const stored = await save(account, value)
