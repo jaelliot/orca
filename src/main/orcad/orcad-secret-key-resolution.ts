@@ -101,7 +101,9 @@ async function migrateKeyringRecord(
   if (replaced !== 'replaced') {
     return context.unavailable(replaced)
   }
-  context.log('[secrets] Copied the credential key from the OS keyring into the owner-only key file.')
+  context.log(
+    '[secrets] Copied the credential key from the OS keyring into the owner-only key file.'
+  )
   return 'reload'
 }
 

@@ -188,7 +188,9 @@ describe('createOrcadSecretStore', () => {
       expect(store.describeProtectionGap()).toContain('cannot unseal')
       expect(() => store.decryptString(sealed)).toThrow(/cannot unseal/)
       setSecretStore(store)
-      expect(() => writeEncryptedCredential('Linear', saved, 'lin_api_new')).toThrow(/cannot unseal/)
+      expect(() => writeEncryptedCredential('Linear', saved, 'lin_api_new')).toThrow(
+        /cannot unseal/
+      )
       expect(readFileSync(statePath)).toEqual(recordBefore)
       expect(readFileSync(saved)).toEqual(sealed)
 
