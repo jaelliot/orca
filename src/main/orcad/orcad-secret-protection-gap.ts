@@ -27,7 +27,8 @@ export function describeOrcadHostKeyGap(hostBound: boolean): string {
 export function describeOrcadSealingUnavailable(reason: string, stateFile: string): string {
   return (
     `Orca's headless server cannot unseal its credentials: ${reason}. Saved credentials are kept ` +
-    `as they are and new ones are refused until this is fixed and the server restarts. To start ` +
-    `over and reconnect every integration, delete ${stateFile}.`
+    `as they are and new ones are refused until this is fixed and the server restarts. ` +
+    `Restore the original key first. Delete ${stateFile} only if you accept losing access to ` +
+    `credentials sealed with the previous key.`
   )
 }

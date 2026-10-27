@@ -18,7 +18,8 @@ import { classifyUnenvelopedCredential } from '../../shared/secret-at-rest-prote
 import { _resetSecretStoreForTests, setSecretStore } from '../../shared/secret-store'
 import { readStoredCredentialToken, writeEncryptedCredential } from '../integration-credential-file'
 import type { OrcadLegacyKeyLookup, OrcadLegacyKeyringReader } from './orcad-legacy-keyring-key'
-import { orcadSecretStateFileName } from './orcad-secret-key-record'
+import type { OrcadKeyringLookup, OrcadOsKeyring } from './orcad-os-keyring'
+import { keyringAccount, orcadSecretStateFileName } from './orcad-secret-key-record'
 import {
   deriveOrcadSealingKey,
   orcadSealingKeyCheck,
@@ -39,6 +40,36 @@ function fakeLegacyKeyring(answer: OrcadLegacyKeyLookup) {
   return { read, reads }
 }
 
+type FakeKeyring = OrcadOsKeyring & {
+  items: Map<string, string>
+  failure: OrcadKeyringLookup | null
+  storeWorks: boolean
+}
+
+function fakeKeyring(): FakeKeyring {
+  const items = new Map<string, string>()
+  const keyring: FakeKeyring = {
+    label: 'the test keyring',
+    items,
+    failure: null,
+    storeWorks: true,
+    async lookup(account) {
+      if (keyring.failure) {
+        return keyring.failure
+      }
+      const value = items.get(account)
+      return value ? { kind: 'found', value } : { kind: 'missing' }
+    },
+    async store(account, value) {
+      if (keyring.storeWorks) {
+        items.set(account, value)
+      }
+      return keyring.storeWorks
+    }
+  }
+  return keyring
+}
+
 describe('createOrcadSecretStore', () => {
   let keyDir: string
 
@@ -55,6 +86,7 @@ describe('createOrcadSecretStore', () => {
   const prepare = async (
     options: {
       legacyKeyring?: OrcadLegacyKeyringReader | null
+      osKeyring?: OrcadOsKeyring | null
       machine?: string | null
       env?: NodeJS.ProcessEnv
       log?: (message: string) => void
@@ -66,6 +98,7 @@ describe('createOrcadSecretStore', () => {
       platform: 'linux',
       env: options.env ?? {},
       legacyKeyring: options.legacyKeyring ?? null,
+      osKeyring: options.osKeyring ?? null,
       machineIdentity: () => (options.machine === undefined ? MACHINE_A : options.machine),
       isTemporaryKeyDir: () => false
     })
@@ -89,6 +122,220 @@ describe('createOrcadSecretStore', () => {
       sealed: sealOrcadSecret(key, 'lin_api_secret')
     }
   }
+
+  const STRICT = { ORCA_HEADLESS_SECRET_STORE: 'keyring' }
+
+  it('uses a strict keyring record on new hosts and never persists the master key', async () => {
+    const keyring = fakeKeyring()
+    const first = await prepare({ env: STRICT, osKeyring: keyring })
+    expect(first.ready).toBe(true)
+    expect(first.store.describeProtectionGap()).toBeNull()
+    const record = JSON.parse(readFileSync(join(keyDir, STATE_A), 'utf8'))
+    expect(record).toMatchObject({ backend: 'os-keyring-strict', hostBound: false })
+    expect(record).not.toHaveProperty('key')
+    expect(keyring.items.size).toBe(1)
+    const master = [...keyring.items.values()][0]
+    expect(readFileSync(join(keyDir, STATE_A), 'utf8')).not.toContain(master)
+    const sealed = first.store.encryptString('lin_api_secret')
+    expect(sealed.includes(Buffer.from('lin_api_secret'))).toBe(false)
+    const reopened = await prepare({ osKeyring: keyring })
+    expect(reopened.ready).toBe(true)
+    expect(reopened.store.decryptString(sealed)).toBe('lin_api_secret')
+    expect(JSON.parse(readFileSync(join(keyDir, STATE_A), 'utf8')).backend).toBe(
+      'os-keyring-strict'
+    )
+  })
+
+  it('never falls back to a file or plaintext if strict mode has no keyring', async () => {
+    const { store, ready } = await prepare({ env: STRICT })
+    expect(ready).toBe(false)
+    expect(store.isEncryptionAvailable()).toBe(true)
+    setSecretStore(store)
+    expect(() => writeEncryptedCredential('Linear', join(keyDir, 'token.enc'), 'secret')).toThrow(
+      /cannot unseal/
+    )
+    expect(readdirSync(keyDir)).toEqual([])
+  })
+
+  it('moves an existing file key to the strict keyring without changing ciphertext', async () => {
+    const sealed = (await prepare()).store.encryptString('lin_api_secret')
+    const previous = JSON.parse(readFileSync(join(keyDir, STATE_A), 'utf8'))
+    const keyring = fakeKeyring()
+    const migrated = await prepare({ env: STRICT, osKeyring: keyring })
+    expect(migrated.ready).toBe(true)
+    expect(migrated.store.decryptString(sealed)).toBe('lin_api_secret')
+    const record = JSON.parse(readFileSync(join(keyDir, STATE_A), 'utf8'))
+    expect(record).toMatchObject({
+      backend: 'os-keyring-strict',
+      hostBound: true,
+      check: previous.check
+    })
+    expect(record).not.toHaveProperty('key')
+    expect(keyring.items.get(keyringAccount(keyDir, MACHINE_A, previous.check))).toBe(previous.key)
+    expect((await prepare({ osKeyring: keyring })).store.decryptString(sealed)).toBe(
+      'lin_api_secret'
+    )
+  })
+
+  it.each(['locked', 'timed out', 'write failed', 'conflicting item'] as const)(
+    'preserves existing encrypted credentials when strict migration is %s',
+    async (failure) => {
+      const keyring = fakeKeyring()
+      const initial = (await prepare()).store
+      const saved = join(keyDir, 'saved.enc')
+      setSecretStore(initial)
+      writeEncryptedCredential('Linear', saved, 'secret-before')
+      const ciphertext = readFileSync(saved)
+      const stateBefore = readFileSync(join(keyDir, STATE_A))
+      if (failure === 'locked' || failure === 'timed out') {
+        keyring.failure = { kind: 'unreachable', reason: failure }
+      } else if (failure === 'write failed') {
+        keyring.storeWorks = false
+      } else {
+        keyring.items.set(
+          keyringAccount(keyDir, MACHINE_A, JSON.parse(stateBefore.toString('utf8')).check),
+          randomBytes(32).toString('base64')
+        )
+      }
+      const failed = await prepare({ env: STRICT, osKeyring: keyring })
+      expect(failed.ready).toBe(false)
+      expect(failed.store.isEncryptionAvailable()).toBe(true)
+      setSecretStore(failed.store)
+      expect(() => writeEncryptedCredential('Linear', saved, 'replacement')).toThrow()
+      expect(readFileSync(join(keyDir, STATE_A))).toEqual(stateBefore)
+      expect(readFileSync(saved)).toEqual(ciphertext)
+      keyring.failure = null
+      keyring.storeWorks = true
+      keyring.items.clear()
+      const recovered = await prepare({ env: STRICT, osKeyring: keyring })
+      expect(recovered.ready).toBe(true)
+      expect(recovered.store.decryptString(ciphertext)).toBe('secret-before')
+    }
+  )
+
+  it('upgrades an existing legacy keyring record to strict without writing its master key', async () => {
+    const { encodedKey, sealed } = legacyKeyringHost()
+    const keyring = fakeKeyring()
+    keyring.items.set('home-0123456789abcdef', encodedKey)
+    const migrated = await prepare({ env: STRICT, osKeyring: keyring })
+    expect(migrated.ready).toBe(true)
+    expect(migrated.store.decryptString(sealed)).toBe('lin_api_secret')
+    const record = JSON.parse(readFileSync(join(keyDir, STATE_A), 'utf8'))
+    expect(record).toMatchObject({
+      backend: 'os-keyring-strict',
+      account: 'home-0123456789abcdef',
+      hostBound: false
+    })
+    expect(record).not.toHaveProperty('key')
+  })
+
+  it('preserves strict records and refuses writes when their keyring becomes locked', async () => {
+    const keyring = fakeKeyring()
+    const first = await prepare({ env: STRICT, osKeyring: keyring })
+    const sealed = first.store.encryptString('secret-before')
+    const before = readFileSync(join(keyDir, STATE_A))
+    keyring.failure = { kind: 'unreachable', reason: 'locked' }
+    const locked = await prepare({ osKeyring: keyring })
+    expect(locked.ready).toBe(false)
+    expect(locked.store.isEncryptionAvailable()).toBe(true)
+    expect(() => locked.store.decryptString(sealed)).toThrow(/cannot unseal/)
+    expect(readFileSync(join(keyDir, STATE_A))).toEqual(before)
+    keyring.failure = null
+    expect((await prepare({ osKeyring: keyring })).store.decryptString(sealed)).toBe(
+      'secret-before'
+    )
+  })
+
+  it('keeps the file-mode winner usable when it races strict keyring creation', async () => {
+    const keyring = fakeKeyring()
+    const save = keyring.store.bind(keyring)
+    const concurrent: { sealed: Buffer } = { sealed: Buffer.alloc(0) }
+    let raced = false
+    keyring.store = async (account, value) => {
+      const stored = await save(account, value)
+      if (!raced) {
+        raced = true
+        const fileMode = await prepare()
+        expect(fileMode.ready).toBe(true)
+        concurrent.sealed = fileMode.store.encryptString('file-winner')
+      }
+      return stored
+    }
+    const strict = await prepare({ env: STRICT, osKeyring: keyring })
+    expect(strict.ready).toBe(true)
+    expect(strict.store.decryptString(concurrent.sealed)).toBe('file-winner')
+    const record = JSON.parse(readFileSync(join(keyDir, STATE_A), 'utf8'))
+    expect(record.backend).toBe('os-keyring-strict')
+    expect(keyring.items.get(record.account)).toBeDefined()
+    expect(
+      (await prepare({ env: STRICT, osKeyring: keyring })).store.decryptString(concurrent.sealed)
+    ).toBe('file-winner')
+  })
+
+  it('refuses implicit plaintext overwrite of strict credentials in temporary profiles', async () => {
+    const keyring = fakeKeyring()
+    const original = (await prepare({ env: STRICT, osKeyring: keyring })).store
+    const saved = join(keyDir, 'token.enc')
+    setSecretStore(original)
+    writeEncryptedCredential('Linear', saved, 'previous-secret')
+    const before = readFileSync(saved)
+    const stateBefore = readFileSync(join(keyDir, STATE_A))
+    const temporary = createOrcadSecretStore()
+    const ready = await temporary.prepare({
+      keyDir,
+      userDataPath: '/tmp/orcad-smoke-profile',
+      env: {},
+      osKeyring: keyring,
+      machineIdentity: () => MACHINE_A
+    })
+    expect(ready).toBe(false)
+    expect(temporary.isEncryptionAvailable()).toBe(true)
+    setSecretStore(temporary)
+    expect(() => writeEncryptedCredential('Linear', saved, 'replacement')).toThrow(/cannot unseal/)
+    expect(readFileSync(saved)).toEqual(before)
+    expect(readFileSync(join(keyDir, STATE_A))).toEqual(stateBefore)
+  })
+
+  it('refuses temporary-profile plaintext when the saved key record is unreadable', async () => {
+    const statePath = join(keyDir, STATE_A)
+    writeFileSync(statePath, '{invalid-json', 'utf8')
+    const temporary = createOrcadSecretStore()
+    const ready = await temporary.prepare({
+      keyDir,
+      userDataPath: '/tmp/orcad-smoke-profile',
+      env: {},
+      machineIdentity: () => MACHINE_A
+    })
+    expect(ready).toBe(false)
+    expect(temporary.isEncryptionAvailable()).toBe(true)
+    expect(readFileSync(statePath, 'utf8')).toBe('{invalid-json')
+  })
+
+  it('does not permit temporary-profile plaintext in strict mode', async () => {
+    const store = createOrcadSecretStore()
+    const ready = await store.prepare({
+      keyDir,
+      userDataPath: '/tmp/orcad-smoke-profile',
+      env: STRICT,
+      osKeyring: fakeKeyring(),
+      machineIdentity: () => MACHINE_A
+    })
+    expect(ready).toBe(false)
+    expect(store.isEncryptionAvailable()).toBe(true)
+    expect(store.describeProtectionGap()).toContain('temporary profiles')
+    expect(readdirSync(keyDir)).toEqual([])
+  })
+
+  it('agrees on the same key across concurrent strict first starts', async () => {
+    const keyring = fakeKeyring()
+    const [first, second] = await Promise.all([
+      prepare({ env: STRICT, osKeyring: keyring }),
+      prepare({ env: STRICT, osKeyring: keyring })
+    ])
+    expect(first.ready && second.ready).toBe(true)
+    expect(keyring.items.size).toBe(1)
+    expect(second.store.decryptString(first.store.encryptString('test'))).toBe('test')
+  })
 
   it('seals with a host-bound profile key when no keyring is reachable', async () => {
     const { store, ready } = await prepare()

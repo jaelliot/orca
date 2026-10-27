@@ -3,6 +3,8 @@ import { join } from 'node:path'
 import process from 'node:process'
 import { withFileTransactionLock } from '../file-transaction-lock'
 import { profileStateAccessMachineIdentity } from '../persistence/profile-state/profile-state-access-identity'
+import { resolveOrcadOsKeyring, type OrcadOsKeyring } from './orcad-os-keyring'
+import { createStrictRecord, loadStrictRecord, migrateToStrict } from './orcad-strict-keyring'
 import {
   resolveOrcadLegacyKeyringReader,
   type OrcadLegacyKeyringReader
@@ -44,16 +46,19 @@ export type OrcadSecretStorePrepareOptions = {
   platform?: NodeJS.Platform
   env?: NodeJS.ProcessEnv
   legacyKeyring?: OrcadLegacyKeyringReader | null
+  osKeyring?: OrcadOsKeyring | null
   machineIdentity?: () => string | null
   isTemporaryKeyDir?: (keyDir: string) => boolean
 }
 
 type Context = {
   machineId: string | null
+  keyDir: string
+  osKeyring: OrcadOsKeyring | null
   statePath: string
   legacyKeyring: () => OrcadLegacyKeyringReader | null
   log: (message: string) => void
-  unavailable: (reason: string) => StoreState
+  unavailable: (reason: string) => Extract<StoreState, { kind: 'unavailable' }>
 }
 
 export function orcadSecretStatePath(options: OrcadSecretStorePrepareOptions): string {
@@ -108,7 +113,7 @@ async function migrateKeyringRecord(
 }
 
 async function loadStoredRecord(
-  stored: StoredKeyState,
+  stored: Exclude<StoredKeyState, { backend: 'os-keyring-strict' }>,
   context: Context
 ): Promise<StoreState | 'reload'> {
   if (stored.backend === 'os-keyring') {
@@ -154,20 +159,38 @@ export async function resolveState(
 ): Promise<StoreState> {
   const platform = options.platform ?? process.platform
   const env = options.env ?? process.env
+  const strict = env[ORCAD_PLAINTEXT_SECRETS_ENV] === 'keyring'
   if (env[ORCAD_PLAINTEXT_SECRETS_ENV] === 'plaintext') {
     return { kind: 'plaintext', reason: describeOrcadPlaintextOptOut() }
   }
-  // Disposable runs must not alter persistent keys or re-seal credentials that outlive them.
+  const machineId = (options.machineIdentity ?? profileStateAccessMachineIdentity)()
+  const statePath = join(options.keyDir, orcadSecretStateFileName(machineId))
+  // Disposable runs must not write plaintext over persistent strict credentials.
   if (
     options.userDataPath &&
     (options.isTemporaryKeyDir ?? isTemporaryKeyDir)(options.userDataPath)
   ) {
+    const existing = readStoredRecord(statePath)
+    if (
+      strict ||
+      existing.kind === 'unreadable' ||
+      (existing.kind === 'record' && existing.stored.backend === 'os-keyring-strict')
+    ) {
+      return {
+        kind: 'unavailable',
+        message: describeOrcadSealingUnavailable(
+          'temporary profiles cannot use an existing strict credential key',
+          statePath
+        )
+      }
+    }
     return { kind: 'plaintext', reason: describeOrcadDisposableProfile() }
   }
-  const machineId = (options.machineIdentity ?? profileStateAccessMachineIdentity)()
-  const statePath = join(options.keyDir, orcadSecretStateFileName(machineId))
   const context: Context = {
     machineId,
+    keyDir: options.keyDir,
+    osKeyring:
+      options.osKeyring === undefined ? resolveOrcadOsKeyring(platform, env) : options.osKeyring,
     statePath,
     legacyKeyring: () =>
       options.legacyKeyring === undefined
@@ -183,7 +206,13 @@ export async function resolveState(
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const existing = readStoredRecord(statePath)
     if (existing.kind === 'record') {
-      const loaded = await loadStoredRecord(existing.stored, context)
+      const stored = existing.stored
+      const loaded =
+        stored.backend === 'os-keyring-strict'
+          ? await loadStrictRecord(stored, context)
+          : strict
+            ? await migrateToStrict(stored, context)
+            : await loadStoredRecord(stored, context)
       if (loaded !== 'reload') {
         return loaded
       }
@@ -191,6 +220,13 @@ export async function resolveState(
     }
     if (existing.kind === 'unreadable') {
       return context.unavailable(existing.reason)
+    }
+    if (strict) {
+      const created = await createStrictRecord(context)
+      if (created !== 'reload') {
+        return created
+      }
+      continue
     }
     const record = newFileRecord(machineId)
     // A key that never reaches disk would lose every sealed credential on restart.
