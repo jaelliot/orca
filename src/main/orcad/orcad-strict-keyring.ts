@@ -114,7 +114,7 @@ export async function migrateToStrict(
         if (orcadSealingKeyCheck(deriveOrcadSealingKey(master, binding)) !== active.check) {
           return context.unavailable('the file-backed credential key does not match its record')
         }
-        account = keyringAccount(context.keyDir, context.machineId)
+        account = keyringAccount(context.keyDir, context.machineId, active.check)
         const error = await ensureKeyringKey(keyring, account, master)
         if (error) {
           return context.unavailable(error)
@@ -158,26 +158,19 @@ export async function createStrictRecord(
       if (!keyring) {
         return context.unavailable('strict keyring storage requires an accessible OS keyring')
       }
-      const account = keyringAccount(context.keyDir, context.machineId)
-      const found = await keyring.lookup(account)
-      if (found.kind === 'unreachable') {
-        return context.unavailable(`${keyring.label} is unavailable (${found.reason})`)
-      }
-      const master =
-        found.kind === 'found' ? decodeMasterKey(found.value) : randomBytes(ORCAD_MASTER_KEY_BYTES)
-      if (!master) {
-        return context.unavailable('an existing keyring item has an invalid credential key')
-      }
+      const master = randomBytes(ORCAD_MASTER_KEY_BYTES)
+      const key = deriveOrcadSealingKey(master, '')
+      const check = orcadSealingKeyCheck(key)
+      const account = keyringAccount(context.keyDir, context.machineId, check)
       const error = await ensureKeyringKey(keyring, account, master)
       if (error) {
         return context.unavailable(error)
       }
-      const key = deriveOrcadSealingKey(master, '')
       const record: StoredKeyState = {
         version: 1,
         backend: 'os-keyring-strict',
         account,
-        check: orcadSealingKeyCheck(key),
+        check,
         hostBound: false
       }
       const published = publishRecordExclusively(context.statePath, record)

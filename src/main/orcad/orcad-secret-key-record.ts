@@ -103,9 +103,9 @@ function machineTag(machineId: string | null): string {
 }
 
 /** Separate keyring accounts for hosts sharing a user home. */
-export function keyringAccount(keyDir: string, machineId: string | null): string {
+export function keyringAccount(keyDir: string, machineId: string | null, check: string): string {
   const digest = createHash('sha256')
-    .update(`${resolve(keyDir)}\0${machineTag(machineId)}`)
+    .update(`${resolve(keyDir)}\0${machineTag(machineId)}\0${check}`)
     .digest('hex')
   return `home-${digest.slice(0, 16)}`
 }

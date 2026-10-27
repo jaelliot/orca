@@ -171,7 +171,7 @@ describe('createOrcadSecretStore', () => {
       check: previous.check
     })
     expect(record).not.toHaveProperty('key')
-    expect(keyring.items.get(keyringAccount(keyDir, MACHINE_A))).toBe(previous.key)
+    expect(keyring.items.get(keyringAccount(keyDir, MACHINE_A, previous.check))).toBe(previous.key)
     expect((await prepare({ osKeyring: keyring })).store.decryptString(sealed)).toBe(
       'lin_api_secret'
     )
@@ -192,7 +192,10 @@ describe('createOrcadSecretStore', () => {
       } else if (failure === 'write failed') {
         keyring.storeWorks = false
       } else {
-        keyring.items.set(keyringAccount(keyDir, MACHINE_A), randomBytes(32).toString('base64'))
+        keyring.items.set(
+          keyringAccount(keyDir, MACHINE_A, JSON.parse(stateBefore.toString('utf8')).check),
+          randomBytes(32).toString('base64')
+        )
       }
       const failed = await prepare({ env: STRICT, osKeyring: keyring })
       expect(failed.ready).toBe(false)
@@ -241,6 +244,73 @@ describe('createOrcadSecretStore', () => {
     expect((await prepare({ osKeyring: keyring })).store.decryptString(sealed)).toBe(
       'secret-before'
     )
+  })
+
+  it('keeps the file-mode winner usable when it races strict keyring creation', async () => {
+    const keyring = fakeKeyring()
+    const save = keyring.store.bind(keyring)
+    const concurrent = { sealed: Buffer.alloc(0) }
+    let raced = false
+    keyring.store = async (account, value) => {
+      const stored = await save(account, value)
+      if (!raced) {
+        raced = true
+        const fileMode = await prepare()
+        expect(fileMode.ready).toBe(true)
+        concurrent.sealed = fileMode.store.encryptString('file-winner')
+      }
+      return stored
+    }
+    const strict = await prepare({ env: STRICT, osKeyring: keyring })
+    expect(strict.ready).toBe(true)
+    expect(strict.store.decryptString(concurrent.sealed)).toBe('file-winner')
+    const record = JSON.parse(readFileSync(join(keyDir, STATE_A), 'utf8'))
+    expect(record.backend).toBe('os-keyring-strict')
+    expect(keyring.items.get(record.account)).toBeDefined()
+    expect((await prepare({ env: STRICT, osKeyring: keyring })).store.decryptString(
+      concurrent.sealed
+    )).toBe('file-winner')
+  })
+
+  it('refuses implicit plaintext overwrite of strict credentials in temporary profiles', async () => {
+    const keyring = fakeKeyring()
+    const original = (await prepare({ env: STRICT, osKeyring: keyring })).store
+    const saved = join(keyDir, 'token.enc')
+    setSecretStore(original)
+    writeEncryptedCredential('Linear', saved, 'previous-secret')
+    const before = readFileSync(saved)
+    const stateBefore = readFileSync(join(keyDir, STATE_A))
+    const temporary = createOrcadSecretStore()
+    const ready = await temporary.prepare({
+      keyDir,
+      userDataPath: '/tmp/orcad-smoke-profile',
+      env: {},
+      osKeyring: keyring,
+      machineIdentity: () => MACHINE_A
+    })
+    expect(ready).toBe(false)
+    expect(temporary.isEncryptionAvailable()).toBe(true)
+    setSecretStore(temporary)
+    expect(() => writeEncryptedCredential('Linear', saved, 'replacement')).toThrow(
+      /cannot unseal/
+    )
+    expect(readFileSync(saved)).toEqual(before)
+    expect(readFileSync(join(keyDir, STATE_A))).toEqual(stateBefore)
+  })
+
+  it('refuses temporary-profile plaintext when the saved key record is unreadable', async () => {
+    const statePath = join(keyDir, STATE_A)
+    writeFileSync(statePath, '{invalid-json', 'utf8')
+    const temporary = createOrcadSecretStore()
+    const ready = await temporary.prepare({
+      keyDir,
+      userDataPath: '/tmp/orcad-smoke-profile',
+      env: {},
+      machineIdentity: () => MACHINE_A
+    })
+    expect(ready).toBe(false)
+    expect(temporary.isEncryptionAvailable()).toBe(true)
+    expect(readFileSync(statePath, 'utf8')).toBe('{invalid-json')
   })
 
   it('does not permit temporary-profile plaintext in strict mode', async () => {

@@ -163,20 +163,29 @@ export async function resolveState(
   if (env[ORCAD_PLAINTEXT_SECRETS_ENV] === 'plaintext') {
     return { kind: 'plaintext', reason: describeOrcadPlaintextOptOut() }
   }
-  // Disposable runs must not alter persistent keys or re-seal credentials that outlive them.
+  const machineId = (options.machineIdentity ?? profileStateAccessMachineIdentity)()
+  const statePath = join(options.keyDir, orcadSecretStateFileName(machineId))
+  // Disposable runs must not write plaintext over persistent strict credentials.
   if (
     options.userDataPath &&
     (options.isTemporaryKeyDir ?? isTemporaryKeyDir)(options.userDataPath)
   ) {
-    return strict
-      ? {
-          kind: 'unavailable',
-          message: 'Strict keyring storage refuses plaintext credentials in temporary profiles.'
-        }
-      : { kind: 'plaintext', reason: describeOrcadDisposableProfile() }
+    const existing = readStoredRecord(statePath)
+    if (
+      strict ||
+      existing.kind === 'unreadable' ||
+      (existing.kind === 'record' && existing.stored.backend === 'os-keyring-strict')
+    ) {
+      return {
+        kind: 'unavailable',
+        message: describeOrcadSealingUnavailable(
+          'temporary profiles cannot use an existing strict credential key',
+          statePath
+        )
+      }
+    }
+    return { kind: 'plaintext', reason: describeOrcadDisposableProfile() }
   }
-  const machineId = (options.machineIdentity ?? profileStateAccessMachineIdentity)()
-  const statePath = join(options.keyDir, orcadSecretStateFileName(machineId))
   const context: Context = {
     machineId,
     keyDir: options.keyDir,
