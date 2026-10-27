@@ -1,0 +1,55 @@
+name: Fork orcad credential validation
+
+on:
+  push:
+    branches:
+      - validation/orcad-pr1
+      - validation/orcad-pr2
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Focused tests, typecheck, and changed checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ORCA_BACKGROUND_LAUNCH: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/install-node-dependencies
+        with:
+          native-runtime: node
+          cache-pnpm-store: 'false'
+          cache-pnpm-verification: 'false'
+          persist-native-cache: 'false'
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: config/.bun-version
+
+      - name: Install Electron test binary
+        run: node config/scripts/install-electron-package-binary.mjs
+
+      - name: Run focused headless credential regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          tests=(src/main/orcad/orcad-secret-store.test.ts src/main/orcad/orcad-legacy-keyring-key.test.ts)
+          headless_dir=src/main/orcad
+          keyring_test="$headless_dir/orcad-os-keyring.test.ts"
+          if test -f "$keyring_test"; then
+            tests+=("$keyring_test")
+          fi
+          pnpm test "${tests[@]}" --maxWorkers=2
+
+      - name: Run repository TypeScript checks
+        run: pnpm tc
+
+      - name: Run repository changed-file quality gate
+        run: pnpm check:changed --maxWorkers=2
