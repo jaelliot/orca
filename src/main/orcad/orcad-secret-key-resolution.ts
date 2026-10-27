@@ -72,7 +72,7 @@ function newFileRecord(machineId: string | null): StoredKeyState {
   }
 }
 
-/** Migrate legacy keyring keys once; inaccessible keys are replaced and old credentials need reconnecting. */
+/** Migrate a readable legacy key once; preserve the existing record if its key cannot be verified. */
 async function migrateKeyringRecord(
   stored: Extract<StoredKeyState, { backend: 'os-keyring' }>,
   context: Context
@@ -80,18 +80,20 @@ async function migrateKeyringRecord(
   const reader = context.legacyKeyring()
   const found = reader ? await reader(stored.account) : { failure: 'no OS keyring is reachable' }
   const master = 'key' in found ? decodeMasterKey(found.key) : null
-  const matches =
-    master !== null && orcadSealingKeyCheck(deriveOrcadSealingKey(master, '')) === stored.check
-  const record: StoredKeyState =
-    master && matches
-      ? {
-          version: 1,
-          backend: 'host-file',
-          key: master.toString('base64'),
-          hostBound: false,
-          check: stored.check
-        }
-      : newFileRecord(context.machineId)
+  if (!master || orcadSealingKeyCheck(deriveOrcadSealingKey(master, '')) !== stored.check) {
+    const why =
+      'failure' in found
+        ? `the OS keyring key could not be loaded (${found.failure})`
+        : 'the OS keyring key does not match the credential record'
+    return context.unavailable(why)
+  }
+  const record: StoredKeyState = {
+    version: 1,
+    backend: 'host-file',
+    key: master.toString('base64'),
+    hostBound: false,
+    check: stored.check
+  }
   const replaced = replaceRecord(context.statePath, record, stored)
   if (replaced === 'changed') {
     return 'reload'
@@ -99,13 +101,7 @@ async function migrateKeyringRecord(
   if (replaced !== 'replaced') {
     return context.unavailable(replaced)
   }
-  const why = 'failure' in found ? found.failure : 'it is not the key the credentials use'
-  context.log(
-    matches
-      ? '[secrets] Copied the credential key from the OS keyring into the owner-only key file.'
-      : `[secrets] Could not read the credential key from the OS keyring (${why}); started a new ` +
-          'key file. Reconnect any integration whose saved credential no longer opens.'
-  )
+  context.log('[secrets] Copied the credential key from the OS keyring into the owner-only key file.')
   return 'reload'
 }
 

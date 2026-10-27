@@ -14,7 +14,6 @@ import { randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { credentialDecryptionMessage } from '../../shared/integration-credential-errors'
 import { classifyUnenvelopedCredential } from '../../shared/secret-at-rest-protection'
 import { _resetSecretStoreForTests, setSecretStore } from '../../shared/secret-store'
 import { readStoredCredentialToken, writeEncryptedCredential } from '../integration-credential-file'
@@ -175,26 +174,30 @@ describe('createOrcadSecretStore', () => {
     ],
     ['unreachable from this session', null]
   ])(
-    'starts a new key file rather than failing closed when the keyring is %s',
+    'preserves the legacy key and sealed credentials when the keyring is %s',
     async (_label, legacyKeyring) => {
-      const { sealed } = legacyKeyringHost()
-      const log = vi.fn()
-      const { store, ready } = await prepare({ legacyKeyring, log })
-      expect(ready).toBe(true)
-      expect(log).toHaveBeenCalledTimes(1)
-      expect(log.mock.calls[0][0]).toContain('Reconnect any integration')
-      setSecretStore(store)
-      expect(() => readStoredCredentialToken('Linear', sealed)).toThrow(
-        credentialDecryptionMessage('Linear')
-      )
+      const { encodedKey, sealed } = legacyKeyringHost()
+      const statePath = join(keyDir, STATE_A)
+      const recordBefore = readFileSync(statePath)
       const saved = join(keyDir, 'saved.enc')
-      writeEncryptedCredential('Linear', saved, 'lin_api_new')
-      expect(readStoredCredentialToken('Linear', readFileSync(saved))).toBe('lin_api_new')
-      const later = fakeLegacyKeyring({ failure: 'exited 36' })
-      expect(
-        (await prepare({ legacyKeyring: later.read })).store.decryptString(readFileSync(saved))
-      ).toBe('lin_api_new')
-      expect(later.reads).toEqual([])
+      writeFileSync(saved, sealed)
+
+      const { store, ready } = await prepare({ legacyKeyring })
+      expect(ready).toBe(false)
+      expect(store.isEncryptionAvailable()).toBe(true)
+      expect(store.describeProtectionGap()).toContain('cannot unseal')
+      expect(() => store.decryptString(sealed)).toThrow(/cannot unseal/)
+      setSecretStore(store)
+      expect(() => writeEncryptedCredential('Linear', saved, 'lin_api_new')).toThrow(/cannot unseal/)
+      expect(readFileSync(statePath)).toEqual(recordBefore)
+      expect(readFileSync(saved)).toEqual(sealed)
+
+      const recovered = await prepare({
+        legacyKeyring: fakeLegacyKeyring({ key: encodedKey }).read
+      })
+      expect(recovered.ready).toBe(true)
+      expect(recovered.store.decryptString(sealed)).toBe('lin_api_secret')
+      expect(JSON.parse(readFileSync(statePath, 'utf8')).backend).toBe('host-file')
     }
   )
 
